@@ -28,6 +28,7 @@ export function ChatPage({ darkMode, onToggleTheme }: ChatPageProps) {
   const error = useChatStore((state) => state.error)
   const loadContacts = useChatStore((state) => state.loadContacts)
   const loadMessages = useChatStore((state) => state.loadMessages)
+  const markConversationSeen = useChatStore((state) => state.markConversationSeen)
   const selectContact = useChatStore((state) => state.selectContact)
   const sendMessage = useChatStore((state) => state.sendMessage)
   const subscribeToMessages = useChatStore((state) => state.subscribeToMessages)
@@ -46,6 +47,44 @@ export function ChatPage({ darkMode, onToggleTheme }: ChatPageProps) {
   useEffect(() => {
     if (user && contactId) void loadMessages(user.id, contactId)
   }, [contactId, loadMessages, user])
+
+  useEffect(() => {
+    if (!user || !contactId) return
+
+    const markWhenActive = () => {
+      if (document.visibilityState === 'visible' && document.hasFocus()) {
+        void markConversationSeen(user.id, contactId)
+      }
+    }
+
+    markWhenActive()
+    window.addEventListener('focus', markWhenActive)
+    document.addEventListener('visibilitychange', markWhenActive)
+
+    return () => {
+      window.removeEventListener('focus', markWhenActive)
+      document.removeEventListener('visibilitychange', markWhenActive)
+    }
+  }, [contactId, markConversationSeen, user])
+
+  useEffect(() => {
+    if (!user || !contactId) return
+
+    const markVisibleConversationSeen = () => {
+      if (document.visibilityState === 'visible' && document.hasFocus()) {
+        void markConversationSeen(user.id, contactId)
+      }
+    }
+
+    markVisibleConversationSeen()
+    window.addEventListener('focus', markVisibleConversationSeen)
+    document.addEventListener('visibilitychange', markVisibleConversationSeen)
+
+    return () => {
+      window.removeEventListener('focus', markVisibleConversationSeen)
+      document.removeEventListener('visibilitychange', markVisibleConversationSeen)
+    }
+  }, [contactId, markConversationSeen, user])
 
   if (!user || !profile) return <LoadingScreen label="Opening your chats" />
 

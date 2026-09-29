@@ -29,6 +29,7 @@ type ChatState = {
   removeContact: (contactId: string) => Promise<void>
   selectContact: (contactId: string | null) => void
   loadMessages: (userId: string, contactId: string) => Promise<void>
+  markConversationSeen: (userId: string, contactId: string) => Promise<void>
   sendMessage: (userId: string, contactId: string, body: string, image: File | null) => Promise<void>
   subscribeToMessages: (userId: string) => () => void
 }
@@ -52,10 +53,23 @@ function orderMessages(messages: DisplayMessage[]) {
   return [...messages].sort((left, right) => left.created_at.localeCompare(right.created_at))
 }
 
-function statusTimestamp(createdAt: string, deliveredAt: string | null = null) {
-  const minimum = Math.max(Date.parse(createdAt), deliveredAt ? Date.parse(deliveredAt) : 0)
-  return new Date(Math.max(Date.now(), minimum)).toISOString()
+function isDocumentActive() {
+  return typeof document !== 'undefined'
+    && document.visibilityState === 'visible'
+    && document.hasFocus()
 }
+
+function getStatusTimestamp(messages: Pick<ChatMessage, 'created_at' | 'delivered_at'>[]) {
+  const latestStatus = messages.reduce((latest, message) => {
+    const createdAt = Date.parse(message.created_at)
+    const deliveredAt = message.delivered_at ? Date.parse(message.delivered_at) : 0
+    return Math.max(latest, createdAt, deliveredAt)
+  }, 0)
+
+  return new Date(Math.max(Date.now(), latestStatus)).toISOString()
+}
+
+const seenRequests = new Map<string, Promise<void>>()
 
 function describeSendError(error: unknown) {
   if (!import.meta.env.DEV) return 'Message could not be sent. Please try again.'
@@ -155,38 +169,84 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ messages: hydrated, loadingMessages: false })
     }
 
-    const unreadIncoming = data.filter(
-      (message) => message.sender_id === contactId && message.receiver_id === userId && !message.read_at,
-    )
-    if (unreadIncoming.length > 0) {
+    void get().loadContacts()
+  },
+
+  markConversationSeen: async (userId, contactId) => {
+    if (!contactId || get().activeContactId !== contactId || !isDocumentActive()) return
+
+    const requestKey = `${userId}:${contactId}`
+    const pendingRequest = seenRequests.get(requestKey)
+    if (pendingRequest) return pendingRequest
+
+    const request = (async () => {
       const client = requireSupabase()
-      const readResults = await Promise.all(unreadIncoming.map(async (message) => {
-        const readAt = statusTimestamp(message.created_at, message.delivered_at)
-        const deliveredAt = message.delivered_at ?? readAt
-        const { error } = await client
-          .from('messages')
-          .update({ delivered_at: deliveredAt, read_at: readAt })
-          .eq('id', message.id)
-          .eq('receiver_id', userId)
-          .is('read_at', null)
+      const { data: unreadMessages, error: queryError } = await client
+        .from('messages')
+        .select('id, created_at, delivered_at')
+        .eq('sender_id', contactId)
+        .eq('receiver_id', userId)
+        .is('read_at', null)
 
-        return { id: message.id, delivered_at: deliveredAt, read_at: readAt, error }
-      }))
+      if (queryError) {
+        set({ error: queryError.message })
+        return
+      }
+      if (!unreadMessages?.length) return
 
-      const readErrors = readResults.filter((result) => result.error)
-      if (readErrors.length > 0) {
-        set({ error: readErrors[0].error?.message ?? 'Unable to mark messages as read.' })
-      } else if (get().activeContactId === contactId) {
-        const statusById = new Map(readResults.map(({ id, delivered_at, read_at }) => [id, { delivered_at, read_at }]))
+      const timestamp = getStatusTimestamp(unreadMessages)
+      const { data: newlyDelivered, error: deliveryError } = await client
+        .from('messages')
+        .update({ delivered_at: timestamp })
+        .eq('sender_id', contactId)
+        .eq('receiver_id', userId)
+        .is('delivered_at', null)
+        .is('read_at', null)
+        .select('id')
+
+      if (deliveryError) {
+        set({ error: deliveryError.message })
+        return
+      }
+
+      const { data: newlyRead, error: readError } = await client
+        .from('messages')
+        .update({ read_at: timestamp })
+        .eq('sender_id', contactId)
+        .eq('receiver_id', userId)
+        .is('read_at', null)
+        .select('id, delivered_at')
+
+      if (readError) {
+        set({ error: readError.message })
+        return
+      }
+
+      const deliveredIds = new Set((newlyDelivered ?? []).map((message) => message.id))
+      const readById = new Map((newlyRead ?? []).map((message) => [message.id, message.delivered_at]))
+      const readIds = new Set(readById.keys())
+      if (deliveredIds.size > 0 || readIds.size > 0) {
         set((state) => ({
           messages: state.messages.map((message) => ({
             ...message,
-            ...(statusById.get(message.id) ?? {}),
+            ...(deliveredIds.has(message.id) ? { delivered_at: timestamp } : {}),
+            ...(readIds.has(message.id) ? {
+              delivered_at: readById.get(message.id) ?? (deliveredIds.has(message.id) ? timestamp : message.delivered_at),
+              read_at: timestamp,
+            } : {}),
           })),
         }))
       }
+
+      void get().loadContacts()
+    })()
+
+    seenRequests.set(requestKey, request)
+    try {
+      await request
+    } finally {
+      if (seenRequests.get(requestKey) === request) seenRequests.delete(requestKey)
     }
-    void get().loadContacts()
   },
 
   sendMessage: async (userId, contactId, body, image) => {
@@ -282,7 +342,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   subscribeToMessages: (userId) => {
     if (!supabase) return () => undefined
 
-    const client = supabase
     let channel: RealtimeChannel | null = null
     let reconciling = false
 
@@ -291,6 +350,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       reconciling = true
 
       try {
+        const client = requireSupabase()
         const pendingOwnMessages = get().messages.filter(
           (message) => message.sender_id === userId && !message.sending
             && (!message.delivered_at || !message.read_at),
@@ -301,6 +361,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             .from('messages')
             .select('id, delivered_at, read_at')
             .in('id', pendingOwnMessages.map((message) => message.id))
+            .eq('sender_id', userId)
 
           if (!error && data) {
             const statusById = new Map(data.map((message) => [message.id, {
@@ -319,7 +380,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         while (true) {
           const { data, error } = await client
             .from('messages')
-            .select('id, sender_id, created_at, delivered_at, read_at')
+            .select('id, sender_id, created_at, delivered_at')
             .eq('receiver_id', userId)
             .is('delivered_at', null)
             .limit(500)
@@ -328,66 +389,54 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
           let updatedCount = 0
           for (const message of data) {
-            const isActive = get().activeContactId === message.sender_id
-            const deliveredAt = statusTimestamp(message.created_at)
-            const statusUpdate = {
-              delivered_at: deliveredAt,
-              ...(!message.read_at && isActive ? { read_at: statusTimestamp(message.created_at, deliveredAt) } : {}),
-            }
-            const { error: updateError } = await client
+            const deliveredAt = getStatusTimestamp([message])
+            const { data: updatedRows, error: deliveryError } = await client
               .from('messages')
-              .update(statusUpdate)
+              .update({ delivered_at: deliveredAt })
               .eq('id', message.id)
               .eq('receiver_id', userId)
               .is('delivered_at', null)
+              .select('id')
 
-            if (updateError) return
+            if (deliveryError) return
+            if (!updatedRows?.length) continue
             updatedCount += 1
+            if (get().activeContactId === message.sender_id && isDocumentActive()) {
+              await get().markConversationSeen(userId, message.sender_id)
+            }
           }
 
           if (updatedCount === 0) break
         }
       } catch {
-        // Reconciliation retries on the next successful channel subscription.
+        // A later SUBSCRIBED event retries status reconciliation.
       } finally {
         reconciling = false
       }
     }
 
-    channel = client
+    channel = supabase
       .channel(`messages:${userId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, async (payload) => {
-        let message = payload.new as ChatMessage
+        const message = payload.new as ChatMessage
         if (!message.id || (message.sender_id !== userId && message.receiver_id !== userId)) return
 
         const peerId = message.sender_id === userId ? message.receiver_id : message.sender_id
         if (payload.eventType === 'INSERT') {
           if (message.receiver_id === userId) {
-            const isActive = get().activeContactId === message.sender_id
+            const deliveredAt = message.delivered_at ?? getStatusTimestamp([message])
             if (!message.delivered_at) {
-              const deliveredAt = statusTimestamp(message.created_at)
-              const statusUpdate = {
-                delivered_at: deliveredAt,
-                ...(isActive && !message.read_at ? { read_at: statusTimestamp(message.created_at, deliveredAt) } : {}),
-              }
-              const { error } = await client
+              const { error: deliveryError } = await requireSupabase()
                 .from('messages')
-                .update(statusUpdate)
+                .update({ delivered_at: deliveredAt })
                 .eq('id', message.id)
                 .eq('receiver_id', userId)
                 .is('delivered_at', null)
 
-              if (!error) message = { ...message, ...statusUpdate }
-            } else if (isActive && !message.read_at) {
-              const readAt = statusTimestamp(message.created_at, message.delivered_at)
-              const { error } = await client
-                .from('messages')
-                .update({ read_at: readAt })
-                .eq('id', message.id)
-                .eq('receiver_id', userId)
-                .is('read_at', null)
-
-              if (!error) message = { ...message, read_at: readAt }
+              if (!deliveryError) message.delivered_at = deliveredAt
+            }
+            if (get().activeContactId === message.sender_id && isDocumentActive()) {
+              await get().markConversationSeen(userId, message.sender_id)
             }
           }
 
@@ -415,7 +464,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       })
 
     return () => {
-      if (channel) void client.removeChannel(channel)
+      if (channel) void supabase?.removeChannel(channel)
     }
   },
 }))

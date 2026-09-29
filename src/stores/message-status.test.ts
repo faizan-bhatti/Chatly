@@ -1,171 +1,202 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+// @vitest-environment jsdom
 
-const realtime = vi.hoisted(() => ({
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { requireSupabase } from '../lib/supabase'
+import { useChatStore } from './chat-store'
+import type { ChatMessage } from '../types/database'
+
+const realtimeMocks = vi.hoisted(() => ({
   channel: vi.fn(),
-  event: vi.fn(),
-  status: vi.fn(),
   removeChannel: vi.fn(),
-  from: vi.fn(),
+  eventHandler: null as ((payload: unknown) => Promise<void>) | null,
+  statusHandler: null as ((status: string) => void) | null,
 }))
 
 vi.mock('../lib/supabase', () => ({
   requireSupabase: vi.fn(),
   supabase: {
-    channel: realtime.channel,
-    removeChannel: realtime.removeChannel,
-    from: realtime.from,
+    channel: realtimeMocks.channel,
+    removeChannel: realtimeMocks.removeChannel,
   },
 }))
 
-import { requireSupabase } from '../lib/supabase'
-import { useChatStore } from './chat-store'
+const userId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const contactId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const messageId = '11111111-1111-4111-8111-111111111111'
 
-const senderId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
-const receiverId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
-
-const incomingMessage = {
-  id: '11111111-1111-4111-8111-111111111111',
-  sender_id: senderId,
-  receiver_id: receiverId,
-  body: 'status test',
-  image_path: null,
-  created_at: '2026-09-29T12:00:00.000Z',
-  delivered_at: null,
-  read_at: null,
+function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
+  return {
+    id: messageId,
+    sender_id: contactId,
+    receiver_id: userId,
+    body: 'status test',
+    image_path: null,
+    created_at: '2026-09-29T12:00:00.000Z',
+    delivered_at: null,
+    read_at: null,
+    ...overrides,
+  }
 }
 
-describe('realtime message delivery and read receipts', () => {
-  let updates: Record<string, string>[]
-  let selectResults: { data: unknown[]; error: null }[]
+type DbRow = Record<string, unknown>
+type DbResult = { data: DbRow[] | null; error: { message: string } | null }
+type Query = PromiseLike<DbResult> & {
+  select: (columns: string) => Query
+  update: (values: Record<string, string>) => Query
+  eq: (column: string, value: string) => Query
+  is: (column: string, value: null) => Query
+  in: (column: string, values: string[]) => Query
+  limit: (value: number) => Query
+}
+
+describe('message delivery and seen status', () => {
+  let rows: ChatMessage[]
+  let updateLog: Array<{ values: Record<string, string>; filters: Record<string, unknown> }>
+  let client: { from: ReturnType<typeof vi.fn>; rpc: ReturnType<typeof vi.fn> }
+  let removeFocusSpy: (() => void) | undefined
 
   beforeEach(() => {
-    updates = []
-    selectResults = []
+    rows = []
+    updateLog = []
+    realtimeMocks.eventHandler = null
+    realtimeMocks.statusHandler = null
+    realtimeMocks.channel.mockReset()
+    realtimeMocks.removeChannel.mockReset()
 
     const channel = {
-      on: vi.fn((_type, _filter, callback) => {
-        realtime.event(callback)
+      on: vi.fn((_type: string, _filter: unknown, callback: (payload: unknown) => Promise<void>) => {
+        realtimeMocks.eventHandler = callback
         return channel
       }),
-      subscribe: vi.fn((callback) => {
-        realtime.status(callback)
+      subscribe: vi.fn((callback: (status: string) => void) => {
+        realtimeMocks.statusHandler = callback
         return channel
       }),
     }
-    realtime.channel.mockReturnValue(channel)
-    realtime.event.mockReset()
-    realtime.status.mockReset()
-    realtime.removeChannel.mockReset()
+    realtimeMocks.channel.mockReturnValue(channel)
 
-    function createQuery() {
-      let operation: 'select' | 'update' | null = null
-      const query: Record<string, unknown> & { then: (resolve: (value: unknown) => unknown) => Promise<unknown> } = {
-        select: vi.fn(() => { operation = 'select'; return query }),
-        update: vi.fn((values: Record<string, string>) => { operation = 'update'; updates.push(values); return query }),
-        eq: vi.fn(() => query),
-        is: vi.fn(() => query),
-        in: vi.fn(() => query),
-        or: vi.fn(() => query),
-        limit: vi.fn(() => query),
-        order: vi.fn(() => query),
-        then: (resolve) => {
-          const result = operation === 'select'
-            ? selectResults.shift() ?? { data: [], error: null }
-            : { data: null, error: null }
-          return Promise.resolve(result).then(resolve)
-        },
-      }
+    function createQuery(): Query {
+      let columns = '*'
+      let updateValues: Record<string, string> | null = null
+      const filters: Record<string, unknown> = {}
+      let maxRows: number | null = null
+      const query = {} as Query
+
+      query.select = (selectedColumns) => { columns = selectedColumns; return query }
+      query.update = (values) => { updateValues = values; return query }
+      query.eq = (column, value) => { filters[column] = value; return query }
+      query.is = (column, value) => { filters[column] = value; return query }
+      query.in = (column, values) => { filters[column] = values; return query }
+      query.limit = (value) => { maxRows = value; return query }
+      query.then = (resolve, reject) => Promise.resolve().then(() => {
+        let matching = rows.filter((row) => Object.entries(filters).every(([column, value]) => {
+          const actual = row[column as keyof ChatMessage]
+          if (value === null) return actual === null
+          if (Array.isArray(value)) return value.includes(String(actual))
+          return actual === value
+        }))
+        if (maxRows !== null) matching = matching.slice(0, maxRows)
+
+        if (updateValues) {
+          updateLog.push({ values: updateValues, filters: { ...filters } })
+          matching.forEach((row) => Object.assign(row, updateValues))
+        }
+
+        const fields = columns.split(',').map((column) => column.trim())
+        const data = matching.map((row) => Object.fromEntries(fields.map((field) => [field, row[field as keyof ChatMessage]])))
+        return { data, error: null }
+      }).then(resolve, reject)
       return query
     }
 
-    realtime.from.mockImplementation(() => createQuery())
-
-    vi.mocked(requireSupabase).mockReturnValue({
+    client = {
       from: vi.fn(() => createQuery()),
       rpc: vi.fn().mockResolvedValue({ data: [], error: null }),
-    } as never)
-
+    }
+    vi.mocked(requireSupabase).mockReturnValue(client as never)
     useChatStore.setState({
+      contacts: [],
       activeContactId: null,
       messages: [],
-      loadingMessages: false,
       loadingContacts: false,
+      loadingMessages: false,
       error: null,
     })
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    const focusSpy = vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    removeFocusSpy = () => focusSpy.mockRestore()
   })
 
-  it('marks a realtime message delivered without marking it read when chat is closed', async () => {
-    useChatStore.getState().subscribeToMessages(receiverId)
-    const onChange = realtime.event.mock.calls[0][0]
+  afterEach(() => removeFocusSpy?.())
 
-    await onChange({ eventType: 'INSERT', new: incomingMessage, old: {} })
+  it('marks incoming messages seen only while their chat and tab are active', async () => {
+    const received = makeMessage()
+    rows = [received]
+    useChatStore.setState({ activeContactId: contactId, messages: [{ ...received }] })
 
-    expect(updates).toHaveLength(1)
-    expect(updates[0]).toHaveProperty('delivered_at')
-    expect(updates[0]).not.toHaveProperty('read_at')
-    expect(useChatStore.getState().activeContactId).toBeNull()
+    await useChatStore.getState().markConversationSeen(userId, contactId)
+
+    expect(updateLog).toHaveLength(2)
+    expect(updateLog[0].values).toHaveProperty('delivered_at')
+    expect(updateLog[0].values).not.toHaveProperty('read_at')
+    expect(updateLog[1].values).toHaveProperty('read_at')
+    expect(rows[0].read_at).toBeTruthy()
+    expect(useChatStore.getState().messages[0].read_at).toBe(rows[0].read_at)
   })
 
-  it('marks an incoming realtime message read only when its conversation is active', async () => {
-    useChatStore.setState({ activeContactId: senderId })
-    useChatStore.getState().subscribeToMessages(receiverId)
-    const onChange = realtime.event.mock.calls[0][0]
+  it('does not mark a background tab as seen', async () => {
+    const received = makeMessage()
+    rows = [received]
+    useChatStore.setState({ activeContactId: contactId, messages: [{ ...received }] })
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
 
-    await onChange({ eventType: 'INSERT', new: incomingMessage, old: {} })
+    await useChatStore.getState().markConversationSeen(userId, contactId)
 
-    expect(updates).toHaveLength(1)
-    expect(updates[0]).toHaveProperty('delivered_at')
-    expect(updates[0]).toHaveProperty('read_at')
-    expect(useChatStore.getState().messages[0]).toMatchObject({
-      delivered_at: expect.any(String),
-      read_at: expect.any(String),
-    })
+    expect(updateLog).toHaveLength(0)
+    expect(rows[0].read_at).toBeNull()
   })
 
-  it('marks incoming history delivered and read when the receiver opens that chat', async () => {
-    selectResults.push({ data: [incomingMessage], error: null })
-    useChatStore.setState({ activeContactId: senderId })
+  it('marks a realtime arrival delivered when chat is closed and seen when visible chat is active', async () => {
+    const received = makeMessage()
+    rows = [received]
+    useChatStore.getState().subscribeToMessages(userId)
+    await realtimeMocks.eventHandler?.({ eventType: 'INSERT', new: received, old: {} })
 
-    await useChatStore.getState().loadMessages(receiverId, senderId)
+    expect(updateLog.map((entry) => entry.values)).toEqual([{ delivered_at: expect.any(String) }])
+    expect(rows[0].delivered_at).toBeTruthy()
+    expect(rows[0].read_at).toBeNull()
 
-    expect(updates).toHaveLength(1)
-    expect(updates[0]).toHaveProperty('delivered_at')
-    expect(updates[0]).toHaveProperty('read_at')
-    expect(useChatStore.getState().messages[0]).toMatchObject({
-      delivered_at: expect.any(String),
-      read_at: expect.any(String),
-    })
+    rows = [makeMessage({ id: '22222222-2222-4222-8222-222222222222' })]
+    updateLog = []
+    useChatStore.setState({ activeContactId: contactId, messages: [{ ...rows[0] }] })
+    await realtimeMocks.eventHandler?.({ eventType: 'INSERT', new: rows[0], old: {} })
+
+    expect(rows[0].delivered_at).toBeTruthy()
+    expect(rows[0].read_at).toBeTruthy()
   })
 
-  it('applies delivery/read UPDATE events to the sender message already in state', async () => {
-    const sentMessage = { ...incomingMessage, sender_id: receiverId, receiver_id: senderId }
-    const deliveredAt = '2026-09-29T12:01:00.000Z'
-    useChatStore.setState({ activeContactId: receiverId, messages: [sentMessage] })
-    useChatStore.getState().subscribeToMessages(senderId)
-    const onChange = realtime.event.mock.calls[0][0]
+  it('reconciles pending delivery on channel resubscription without creating another listener', async () => {
+    const received = makeMessage()
+    rows = [received]
+    useChatStore.getState().subscribeToMessages(userId)
+    expect(realtimeMocks.channel).toHaveBeenCalledOnce()
+    realtimeMocks.statusHandler?.('SUBSCRIBED')
 
-    await onChange({
-      eventType: 'UPDATE',
-      new: { ...sentMessage, delivered_at: deliveredAt, read_at: null },
-      old: sentMessage,
-    })
-
-    expect(useChatStore.getState().messages[0]).toMatchObject({
-      delivered_at: deliveredAt,
-      read_at: null,
-    })
+    await vi.waitFor(() => expect(rows[0].delivered_at).toBeTruthy())
+    expect(rows[0].read_at).toBeNull()
+    expect(realtimeMocks.channel).toHaveBeenCalledOnce()
   })
 
-  it('reconciles missed delivery receipts after realtime reconnect', async () => {
-    selectResults.push({ data: [incomingMessage], error: null }, { data: [], error: null })
-    useChatStore.getState().subscribeToMessages(receiverId)
-    const onStatus = realtime.status.mock.calls[0][0]
+  it('refreshes the sender state from persisted status updates', async () => {
+    const sent = makeMessage({ sender_id: userId, receiver_id: contactId, delivered_at: null, read_at: null })
+    const updated = { ...sent, delivered_at: '2026-09-29T12:01:00.000Z', read_at: null }
+    rows = [updated]
+    useChatStore.setState({ activeContactId: contactId, messages: [{ ...sent }] })
+    useChatStore.getState().subscribeToMessages(userId)
+    await realtimeMocks.eventHandler?.({ eventType: 'UPDATE', new: updated, old: sent })
 
-    onStatus('SUBSCRIBED')
-    await vi.waitFor(() => expect(updates).toHaveLength(1))
-
-    expect(updates[0]).toHaveProperty('delivered_at')
-    expect(updates[0]).not.toHaveProperty('read_at')
-    expect(realtime.channel).toHaveBeenCalledOnce()
+    expect(useChatStore.getState().messages[0].delivered_at).toBe(updated.delivered_at)
+    expect(useChatStore.getState().messages[0].read_at).toBeNull()
   })
 })

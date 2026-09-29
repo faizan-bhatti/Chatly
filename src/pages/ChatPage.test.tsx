@@ -6,6 +6,10 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-rou
 import { useChatStore } from '../stores/chat-store'
 import { ChatPage } from './ChatPage'
 
+const statusMocks = vi.hoisted(() => ({
+  markConversationSeen: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('../stores/auth-store', async () => {
   const { create } = await import('zustand')
   return {
@@ -62,6 +66,7 @@ vi.mock('../stores/chat-store', async () => {
       removeContact: vi.fn().mockResolvedValue(undefined),
       selectContact: (contactId: string | null) => set({ activeContactId: contactId, messages: [], error: null }),
       loadMessages: vi.fn().mockResolvedValue(undefined),
+      markConversationSeen: statusMocks.markConversationSeen,
       sendMessage: vi.fn().mockResolvedValue(undefined),
       subscribeToMessages: vi.fn().mockReturnValue(() => undefined),
     })),
@@ -100,10 +105,37 @@ function RouterHarness() {
 
 describe('chat route selection', () => {
   beforeEach(() => {
+    statusMocks.markConversationSeen.mockClear()
     useChatStore.setState({ activeContactId: null, messages: [], error: null })
   })
 
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('marks a directly opened route as seen when its tab is visible and focused', async () => {
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+
+    render(
+      <MemoryRouter initialEntries={['/chat/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb']}>
+        <RouterHarness />
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByRole('heading', { name: 'Receiver One' })).toBeTruthy()
+    await waitFor(() => {
+      expect(statusMocks.markConversationSeen).toHaveBeenCalledWith(
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      )
+    })
+
+    fireEvent.focus(window)
+    fireEvent(document, new Event('visibilitychange'))
+    expect(statusMocks.markConversationSeen.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
 
   it('opens the same contact again after back and supports browser back/forward', async () => {
     render(
