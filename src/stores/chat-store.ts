@@ -52,6 +52,11 @@ function orderMessages(messages: DisplayMessage[]) {
   return [...messages].sort((left, right) => left.created_at.localeCompare(right.created_at))
 }
 
+function statusTimestamp(createdAt: string, deliveredAt: string | null = null) {
+  const minimum = Math.max(Date.parse(createdAt), deliveredAt ? Date.parse(deliveredAt) : 0)
+  return new Date(Math.max(Date.now(), minimum)).toISOString()
+}
+
 function describeSendError(error: unknown) {
   if (!import.meta.env.DEV) return 'Message could not be sent. Please try again.'
 
@@ -150,14 +155,37 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set({ messages: hydrated, loadingMessages: false })
     }
 
-    const { error: readError } = await requireSupabase()
-      .from('messages')
-      .update({ delivered_at: new Date().toISOString(), read_at: new Date().toISOString() })
-      .eq('sender_id', contactId)
-      .eq('receiver_id', userId)
-      .is('read_at', null)
+    const unreadIncoming = data.filter(
+      (message) => message.sender_id === contactId && message.receiver_id === userId && !message.read_at,
+    )
+    if (unreadIncoming.length > 0) {
+      const client = requireSupabase()
+      const readResults = await Promise.all(unreadIncoming.map(async (message) => {
+        const readAt = statusTimestamp(message.created_at, message.delivered_at)
+        const deliveredAt = message.delivered_at ?? readAt
+        const { error } = await client
+          .from('messages')
+          .update({ delivered_at: deliveredAt, read_at: readAt })
+          .eq('id', message.id)
+          .eq('receiver_id', userId)
+          .is('read_at', null)
 
-    if (readError) set({ error: readError.message })
+        return { id: message.id, delivered_at: deliveredAt, read_at: readAt, error }
+      }))
+
+      const readErrors = readResults.filter((result) => result.error)
+      if (readErrors.length > 0) {
+        set({ error: readErrors[0].error?.message ?? 'Unable to mark messages as read.' })
+      } else if (get().activeContactId === contactId) {
+        const statusById = new Map(readResults.map(({ id, delivered_at, read_at }) => [id, { delivered_at, read_at }]))
+        set((state) => ({
+          messages: state.messages.map((message) => ({
+            ...message,
+            ...(statusById.get(message.id) ?? {}),
+          })),
+        }))
+      }
+    }
     void get().loadContacts()
   },
 
@@ -254,22 +282,113 @@ export const useChatStore = create<ChatState>((set, get) => ({
   subscribeToMessages: (userId) => {
     if (!supabase) return () => undefined
 
+    const client = supabase
     let channel: RealtimeChannel | null = null
-    channel = supabase
+    let reconciling = false
+
+    async function reconcileStatuses() {
+      if (reconciling) return
+      reconciling = true
+
+      try {
+        const pendingOwnMessages = get().messages.filter(
+          (message) => message.sender_id === userId && !message.sending
+            && (!message.delivered_at || !message.read_at),
+        )
+
+        if (pendingOwnMessages.length > 0) {
+          const { data, error } = await client
+            .from('messages')
+            .select('id, delivered_at, read_at')
+            .in('id', pendingOwnMessages.map((message) => message.id))
+
+          if (!error && data) {
+            const statusById = new Map(data.map((message) => [message.id, {
+              delivered_at: message.delivered_at,
+              read_at: message.read_at,
+            }]))
+            set((state) => ({
+              messages: state.messages.map((message) => ({
+                ...message,
+                ...(statusById.get(message.id) ?? {}),
+              })),
+            }))
+          }
+        }
+
+        while (true) {
+          const { data, error } = await client
+            .from('messages')
+            .select('id, sender_id, created_at, delivered_at, read_at')
+            .eq('receiver_id', userId)
+            .is('delivered_at', null)
+            .limit(500)
+
+          if (error || !data?.length) break
+
+          let updatedCount = 0
+          for (const message of data) {
+            const isActive = get().activeContactId === message.sender_id
+            const deliveredAt = statusTimestamp(message.created_at)
+            const statusUpdate = {
+              delivered_at: deliveredAt,
+              ...(!message.read_at && isActive ? { read_at: statusTimestamp(message.created_at, deliveredAt) } : {}),
+            }
+            const { error: updateError } = await client
+              .from('messages')
+              .update(statusUpdate)
+              .eq('id', message.id)
+              .eq('receiver_id', userId)
+              .is('delivered_at', null)
+
+            if (updateError) return
+            updatedCount += 1
+          }
+
+          if (updatedCount === 0) break
+        }
+      } catch {
+        // Reconciliation retries on the next successful channel subscription.
+      } finally {
+        reconciling = false
+      }
+    }
+
+    channel = client
       .channel(`messages:${userId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, async (payload) => {
-        const message = payload.new as ChatMessage
+        let message = payload.new as ChatMessage
         if (!message.id || (message.sender_id !== userId && message.receiver_id !== userId)) return
 
         const peerId = message.sender_id === userId ? message.receiver_id : message.sender_id
         if (payload.eventType === 'INSERT') {
           if (message.receiver_id === userId) {
             const isActive = get().activeContactId === message.sender_id
-            const timestamp = new Date().toISOString()
-            await requireSupabase()
-              .from('messages')
-              .update({ delivered_at: timestamp, ...(isActive ? { read_at: timestamp } : {}) })
-              .eq('id', message.id)
+            if (!message.delivered_at) {
+              const deliveredAt = statusTimestamp(message.created_at)
+              const statusUpdate = {
+                delivered_at: deliveredAt,
+                ...(isActive && !message.read_at ? { read_at: statusTimestamp(message.created_at, deliveredAt) } : {}),
+              }
+              const { error } = await client
+                .from('messages')
+                .update(statusUpdate)
+                .eq('id', message.id)
+                .eq('receiver_id', userId)
+                .is('delivered_at', null)
+
+              if (!error) message = { ...message, ...statusUpdate }
+            } else if (isActive && !message.read_at) {
+              const readAt = statusTimestamp(message.created_at, message.delivered_at)
+              const { error } = await client
+                .from('messages')
+                .update({ read_at: readAt })
+                .eq('id', message.id)
+                .eq('receiver_id', userId)
+                .is('read_at', null)
+
+              if (!error) message = { ...message, read_at: readAt }
+            }
           }
 
           if (get().activeContactId === peerId) {
@@ -291,10 +410,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           void get().loadContacts()
         }
       })
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') void reconcileStatuses()
+      })
 
     return () => {
-      if (channel) void supabase?.removeChannel(channel)
+      if (channel) void client.removeChannel(channel)
     }
   },
 }))
